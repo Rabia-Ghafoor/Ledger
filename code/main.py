@@ -73,6 +73,23 @@ RESOLVED_IMAGE_AMOUNTS = {
 RECURRING_EVENT_TYPES = {"expense", "subscription", "debt_payment"}
 INACTIVE_STATUSES = {"cancelled", "failed"}
 
+# The dataset's income rows use a fixed taxonomy of `description` values.
+# Tried gating recurring-income projection on description (stable payroll vs
+# gig/freelance/bonus), since the rules say never to treat commissions/bonuses
+# as guaranteed -- but this regressed known-correct cases as often as it
+# fixed others (freelancers whose irregular income the reference model still
+# projects forward), so all of a user's income is grouped together
+# regardless of description, same as blanket salary. The one signal that
+# clearly and consistently helps: an explicit statement that income just
+# stopped or paused.
+#
+# If the user's single most recent income-category record (regardless of
+# description) is one of these, their employment income has just ended or
+# paused -- do not project ANY further income for them.
+INCOME_TERMINATION_DESCRIPTIONS = {
+    "Final employer payroll", "Previous employer payroll", "Payroll before leave",
+}
+
 
 # --------------------------------------------------------------------------
 # Small helpers
@@ -83,6 +100,22 @@ def parse_date(s):
 
 def fmt_date(d):
     return d.strftime("%Y-%m-%d")
+
+
+def fmt_date_human(d):
+    """'15 June 2024' -- avoids the non-portable '%-d' strftime flag."""
+    return f"{d.day} {d.strftime('%B')} {d.year}"
+
+
+def fmt_amount_human(x):
+    """fmt_amount with thousands separators, for prose explanations."""
+    r = round(float(x) + 1e-9, 2)
+    whole = int(r)
+    frac = round(abs(r) - abs(whole), 2)
+    if frac < 1e-6:
+        return f"{whole:,}"
+    s = f"{abs(whole):,}.{round(frac * 100):02d}"
+    return f"-{s}" if whole < 0 or (whole == 0 and r < 0) else s
 
 
 def parse_pipe_list(s):
@@ -340,10 +373,17 @@ class RecurringSeries:
 def detect_recurring_series(events_by_user):
     """Detect recurring cash-flow series per user from settled/known history:
     recurring expenses (debit: expense/subscription/debt_payment) AND
-    recurring salary (credit income, category 'salary') -- most users have no
-    explicit future salary row and only show a repeating settled history, so
-    salary must be projected the same way recurring expenses are, or the
-    90-day forecast would show one-way depletion with no income at all."""
+    recurring income (credit). Most users have no explicit future salary row
+    and only a repeating settled history, so income must be projected the
+    same way recurring expenses are, or the 90-day forecast would show
+    one-way depletion with no income at all. Income descriptions vary even
+    for one continuous income stream (a job change, a seasonal-contract
+    label, a switch from "Prorated first salary" to "Payroll credit"), so
+    -- unlike expenses -- all of a user's income rows are grouped together
+    rather than requiring the same description to repeat verbatim. The one
+    exception: if the single most recent income record's description
+    signals employment just ended or paused (INCOME_TERMINATION_DESCRIPTIONS,
+    e.g. "Final employer payroll"), no further income is projected at all."""
     series_by_user = defaultdict(list)
     for user_id, evs in events_by_user.items():
         groups = defaultdict(list)
@@ -351,20 +391,32 @@ def detect_recurring_series(events_by_user):
             if e.status in INACTIVE_STATUSES:
                 continue
             is_recurring_expense = e.event_type in RECURRING_EVENT_TYPES and e.direction == "debit"
-            is_recurring_income = e.event_type == "income" and e.category == "salary" and e.direction == "credit"
+            is_recurring_income = e.event_type == "income" and e.direction == "credit"
             if not (is_recurring_expense or is_recurring_income):
                 continue
-            # Salary descriptions embed the month/occasion (e.g. "August 2019
-            # net salary", "Prorated first salary", "Next confirmed salary")
-            # and never repeat verbatim, so group all of a user's salary rows
-            # under one key; recurring expense descriptions repeat verbatim
-            # every cycle, so those group correctly by their own text.
-            key = "__salary__" if is_recurring_income else e.description
+            if is_recurring_income:
+                # "Second household income" is a second, concurrent earner --
+                # a genuinely separate cash-flow stream, not another label for
+                # the same job. Blending it into the main income bucket
+                # corrupts both: the combined cadence stops lining up with
+                # either earner's real pay date, and the second earner's own
+                # amount gets silently dropped from every projected date
+                # after their history ends (only the blended group's single
+                # `last_amount` carries forward). Every other income
+                # description (job changes, prorated first months, seasonal
+                # contracts, gig payouts) represents one person's evolving
+                # income and is blended, since those labels don't repeat
+                # verbatim across a transition.
+                key = "Second household income" if e.description == "Second household income" else "__income__"
+            else:
+                key = e.description
             groups[key].append(e)
         for desc, group in groups.items():
             if len(group) < 2:
                 continue
             group.sort(key=lambda e: e.event_date)
+            if desc == "__income__" and group[-1].description in INCOME_TERMINATION_DESCRIPTIONS:
+                continue
             first_d = parse_date(group[0].event_date)
             last_d = parse_date(group[-1].event_date)
             span = (last_d - first_d).days
@@ -513,6 +565,17 @@ def min_running_balance(balance_now, flows, start, end):
     return worst, timeline
 
 
+def worst_point(timeline):
+    """Earliest (date, balance) in a timeline at which the minimum balance
+    is reached -- used to ground explanations in a concrete date/amount
+    rather than a generic restatement of the minimum-balance rule."""
+    worst_balance = min(b for _, b in timeline)
+    for d, b in timeline:
+        if abs(b - worst_balance) < 1e-6:
+            return d, worst_balance
+    return timeline[-1]
+
+
 def earliest_safe_full_payment_date(balance_now, flows, min_balance, requested_amount,
                                      start, end):
     """First date d such that paying requested_amount in full on d, given the
@@ -597,9 +660,9 @@ def simulate_installment_safety(balance_now, base_flows, min_balance, option, st
         f.description, f.category = "installment_payment", "installment"
         flows.append(f)
 
-    worst, _ = min_running_balance(balance_now, flows, start, horizon_end)
+    worst, timeline = min_running_balance(balance_now, flows, start, horizon_end)
     safe = worst >= min_balance - 1e-6
-    return safe, pay_dates, plan_end
+    return safe, pay_dates, plan_end, worst_point(timeline)
 
 
 def build_payment_plan_str(pairs):
@@ -620,8 +683,9 @@ def decide(request, profile, events, series_list, options, window_end):
     balance_now = profile.current_available_balance
     min_balance = profile.minimum_balance_to_keep
 
-    amt_safe0 = amount_safe_today(balance_now, base_flows, min_balance, requested_amount,
-                                   request_date, window_end)
+    worst, timeline = min_running_balance(balance_now, base_flows, request_date, window_end)
+    worst_date, worst_balance = worst_point(timeline)
+    amt_safe0 = max(0.0, min(requested_amount, worst - min_balance))
     earliest_full = earliest_safe_full_payment_date(balance_now, base_flows, min_balance,
                                                       requested_amount, request_date, window_end)
 
@@ -659,7 +723,7 @@ def decide(request, profile, events, series_list, options, window_end):
                 continue
             if opt.number_of_payments > profile.max_installment_months:
                 continue
-            safe, pay_dates, plan_end = simulate_installment_safety(
+            safe, pay_dates, plan_end, opt_worst = simulate_installment_safety(
                 balance_now, base_flows, min_balance, opt, request_date, window_end)
             if not safe:
                 continue
@@ -672,7 +736,7 @@ def decide(request, profile, events, series_list, options, window_end):
                 "uses_changes": False, "total_paid": total_paid,
                 "first_date": pay_dates[0] if pay_dates else request_date,
                 "n_payments": opt.number_of_payments, "tiebreak": opt.payment_option_id,
-                "status": "affordable_with_plan",
+                "status": "affordable_with_plan", "worst_point": opt_worst,
             })
 
     # wait (full payment later)
@@ -698,6 +762,9 @@ def decide(request, profile, events, series_list, options, window_end):
     amt_safe_final = max(0.0, min(requested_amount, amt_safe0))
 
     if chosen is None:
+        explanation = explain_not_recommended(
+            profile, requested_amount, amt_safe_final, request_date, desired_completion,
+            worst_balance, worst_date, earliest_full)
         return {
             "amount_safe_to_pay": amt_safe_final,
             "affordability_status": "not_affordable",
@@ -705,9 +772,12 @@ def decide(request, profile, events, series_list, options, window_end):
             "payment_plan": "none",
             "earliest_date_for_full_payment": earliest_full,
             "spending_changes": [],
-            "explanation": explain_not_recommended(profile, requested_amount, amt_safe_final, request_date),
+            "explanation": explanation,
         }
 
+    explanation = explain_choice(
+        profile, request, chosen, requested_amount, amt_safe0, earliest_full,
+        worst_balance, worst_date, desired_completion)
     return {
         "amount_safe_to_pay": amt_safe_final,
         "affordability_status": chosen["status"],
@@ -715,7 +785,7 @@ def decide(request, profile, events, series_list, options, window_end):
         "payment_plan": build_payment_plan_str(chosen["plan"]),
         "earliest_date_for_full_payment": earliest_full,
         "spending_changes": chosen.get("changes", []),
-        "explanation": explain_choice(profile, request, chosen, requested_amount, amt_safe0, earliest_full),
+        "explanation": explanation,
     }
 
 
@@ -788,7 +858,7 @@ def try_spending_changes(profile, series_list, request_date, desired_completion,
                     continue
                 if opt.number_of_payments > profile.max_installment_months:
                     continue
-                safe, pay_dates, plan_end = simulate_installment_safety(
+                safe, pay_dates, plan_end, opt_worst = simulate_installment_safety(
                     balance_now, trial_flows, min_balance, opt, request_date, window_end)
                 if safe and plan_end <= desired_completion:
                     total_paid = opt.total_payable_amount if opt.total_payable_amount is not None \
@@ -800,6 +870,7 @@ def try_spending_changes(profile, series_list, request_date, desired_completion,
                         "total_paid": total_paid, "first_date": pay_dates[0],
                         "n_payments": opt.number_of_payments, "tiebreak": opt.payment_option_id,
                         "status": "affordable_with_plan", "changes": change_tags,
+                        "worst_point": opt_worst,
                     })
                     return new_candidates
 
@@ -824,49 +895,133 @@ def rank_candidates(candidates):
 # --------------------------------------------------------------------------
 # Explanations
 # --------------------------------------------------------------------------
-def explain_choice(profile, request, chosen, requested_amount, amt_safe0, earliest_full):
+def _describe_changes(changes, cur):
+    """Render stop:/reduce_to: tags as a short clause grounded in what each
+    change actually does, e.g. 'stopping event_476' -> 'pausing the
+    recurring event_476 payment' -- readable without inventing a merchant
+    name we were never given."""
+    if not changes:
+        return ""
+    readable = []
+    for c in changes:
+        if c.startswith("stop:"):
+            eid = c.split(":", 1)[1]
+            readable.append(f"pausing the recurring {eid} payment")
+        else:
+            _, eid, amt = c.split(":")
+            readable.append(f"reducing the recurring {eid} payment to {cur} {fmt_amount_human(amt)}")
+    if len(readable) == 1:
+        return readable[0]
+    return " and ".join(readable) if len(readable) == 2 else ", ".join(readable[:-1]) + f", and {readable[-1]}"
+
+
+def explain_choice(profile, request, chosen, requested_amount, amt_safe0, earliest_full,
+                    worst_balance, worst_date, desired_completion):
     cur = profile.home_currency
+    min_bal = profile.minimum_balance_to_keep
     method = chosen["method"]
     changes = chosen.get("changes", [])
-    change_txt = ""
-    if changes:
-        readable = []
-        for c in changes:
-            if c.startswith("stop:"):
-                readable.append(f"stopping {c.split(':')[1]}")
-            else:
-                _, eid, amt = c.split(":")
-                readable.append(f"reducing {eid} to {cur} {amt}")
-        change_txt = " after " + " and ".join(readable)
+    uses_changes = bool(changes)
+    change_clause = _describe_changes(changes, cur)
 
     if method == "full_payment":
-        req_date = request["request_date"]
-        return (f"Pay {cur} {fmt_amount(requested_amount)} in full on {req_date}"
-                f"{change_txt}. This keeps the {cur} {fmt_amount(profile.minimum_balance_to_keep)} "
-                f"minimum protected over the next {FORECAST_DAYS} days.")
+        req_date_h = fmt_date_human(parse_date(request["request_date"]))
+        if uses_changes:
+            return (f"Pay {cur} {fmt_amount_human(requested_amount)} in full on {req_date_h} after "
+                    f"{change_clause}, which frees enough headroom to cover the shortfall. This keeps the "
+                    f"{cur} {fmt_amount_human(min_bal)} minimum protected over the next {FORECAST_DAYS} days.")
+        tightest = worst_balance - requested_amount
+        return (f"Pay {cur} {fmt_amount_human(requested_amount)} in full on {req_date_h}. Even after this "
+                f"payment, the forecast stays at or above the {cur} {fmt_amount_human(min_bal)} minimum "
+                f"through the next {FORECAST_DAYS} days -- the tightest point is {cur} "
+                f"{fmt_amount_human(tightest)} around {fmt_date_human(worst_date)}.")
+
     if method == "partial_payment":
-        remainder = requested_amount - amt_safe0
-        return (f"Pay {cur} {fmt_amount(amt_safe0)} today and the remaining {cur} "
-                f"{fmt_amount(remainder)} on {fmt_date(earliest_full)}{change_txt}. This completes "
-                f"the full request while keeping the {cur} {fmt_amount(profile.minimum_balance_to_keep)} minimum protected.")
+        # Read the actual amounts/dates from the chosen plan, not amt_safe0 /
+        # earliest_full -- those are the pre-change, natural-forecast values
+        # and would silently contradict the payment_plan column whenever a
+        # spending change was needed to make this plan work.
+        first_date, first_amt = chosen["plan"][0]
+        second_date, second_amt = chosen["plan"][1]
+        change_prefix = f"After {change_clause}, p" if uses_changes else "P"
+        min_bal_note = " (after the change above)" if uses_changes else ""
+        return (f"{change_prefix}ay {cur} {fmt_amount_human(first_amt)} today -- the most that stays above "
+                f"the {cur} {fmt_amount_human(min_bal)} minimum{min_bal_note} -- then the remaining {cur} "
+                f"{fmt_amount_human(second_amt)} on {fmt_date_human(second_date)}, once the forecast can "
+                f"absorb the rest safely. Together the two payments complete the full {cur} "
+                f"{fmt_amount_human(requested_amount)} request on time.")
+
     if method == "installments":
         n = chosen["n_payments"]
-        first = fmt_date(chosen["plan"][0][0])
-        amt = fmt_amount(chosen["plan"][0][1])
-        return (f"Use {n} installments of {cur} {amt}, starting {first}{change_txt}. This leaves at "
-                f"least {cur} {fmt_amount(profile.minimum_balance_to_keep)} available.")
+        first_date, first_amt = chosen["plan"][0]
+        total_paid = chosen["total_paid"]
+        fee_clause = ""
+        if total_paid - requested_amount > 0.5:
+            fee_clause = (f" (a financing cost of {cur} {fmt_amount_human(total_paid - requested_amount)} "
+                          f"over paying in full)")
+        change_prefix = f"After {change_clause}, u" if uses_changes else "U"
+        if "full_payment" not in profile.payment_methods_accepted:
+            why_not_full = "full payment is not an accepted payment method for this account"
+        elif amt_safe0 < requested_amount - 1e-6:
+            why_not_full = (f"paying the full {cur} {fmt_amount_human(requested_amount)} today would fall "
+                            f"{cur} {fmt_amount_human(requested_amount - amt_safe0)} short of safe")
+        else:
+            why_not_full = "installments are the safer, lower-commitment option here"
+        return (f"{change_prefix}se {n} installments of {cur} {fmt_amount_human(first_amt)}, starting "
+                f"{fmt_date_human(first_date)}{fee_clause}. {why_not_full.capitalize()}, but spreading it "
+                f"this way keeps at least {cur} {fmt_amount_human(profile.minimum_balance_to_keep)} "
+                f"available throughout.")
+
     if method == "wait":
-        return (f"Wait until {fmt_date(earliest_full)}, then pay {cur} {fmt_amount(requested_amount)} "
-                f"in full. Paying sooner would put the {cur} {fmt_amount(profile.minimum_balance_to_keep)} "
-                f"minimum at risk.")
-    return "No safe recommendation could be generated."
+        shortfall = requested_amount - amt_safe0
+        deadline_clause = ""
+        if earliest_full > desired_completion:
+            deadline_clause = (f" This is later than the requested {fmt_date_human(desired_completion)} "
+                               f"deadline, but no safe method completes it sooner.")
+        return (f"Wait until {fmt_date_human(earliest_full)}, then pay {cur} "
+                f"{fmt_amount_human(requested_amount)} in full. Paying now would only be safe up to "
+                f"{cur} {fmt_amount_human(amt_safe0)} -- {cur} {fmt_amount_human(shortfall)} short of the "
+                f"full amount -- and would put the {cur} {fmt_amount_human(profile.minimum_balance_to_keep)} "
+                f"minimum at risk before then.{deadline_clause}")
+
+    return "No safe recommendation could be generated from the available data."
 
 
-def explain_not_recommended(profile, requested_amount, amt_safe_final, request_date):
+def explain_not_recommended(profile, requested_amount, amt_safe_final, request_date,
+                             desired_completion, worst_balance, worst_date, earliest_full):
     cur = profile.home_currency
-    return (f"Do not make this payment by the requested date. None of the available options keeps "
-            f"the {cur} {fmt_amount(profile.minimum_balance_to_keep)} minimum protected, although "
-            f"{cur} {fmt_amount(amt_safe_final)} is available today.")
+    min_bal = profile.minimum_balance_to_keep
+    deadline_h = fmt_date_human(desired_completion)
+    accepts_full = "full_payment" in profile.payment_methods_accepted
+
+    if earliest_full is not None:
+        # It does become financially safe eventually -- just not through any
+        # method/timing this user accepts, so the reason is about
+        # preference/deadline fit, not raw affordability.
+        if not accepts_full:
+            methods = ", ".join(sorted(profile.payment_methods_accepted)) or "none"
+            return (f"The full {cur} {fmt_amount_human(requested_amount)} would be safe to pay in one "
+                    f"payment by {fmt_date_human(earliest_full)}, but the accepted payment methods for this "
+                    f"account ({methods}) do not include full payment, and no installment or partial-payment "
+                    f"option here is both permitted and safe. {cur} {fmt_amount_human(amt_safe_final)} is "
+                    f"available today without breaking the {cur} {fmt_amount_human(min_bal)} minimum.")
+        return (f"The full {cur} {fmt_amount_human(requested_amount)} is not projected to be safe until "
+                f"{fmt_date_human(earliest_full)}, which is after the {deadline_h} deadline, and no "
+                f"installment or partial-payment option completes it any sooner without breaking the "
+                f"{cur} {fmt_amount_human(min_bal)} minimum. {cur} {fmt_amount_human(amt_safe_final)} is "
+                f"available today.")
+
+    # Never safe as a single payment within the 90-day forecast at all.
+    if amt_safe_final > 0.01:
+        return (f"Do not make this payment by {deadline_h}. {cur} {fmt_amount_human(amt_safe_final)} is "
+                f"available today without breaking the {cur} {fmt_amount_human(min_bal)} minimum, but the "
+                f"remaining {cur} {fmt_amount_human(requested_amount - amt_safe_final)} cannot be safely "
+                f"covered within the next {FORECAST_DAYS} days -- the forecast falls as low as {cur} "
+                f"{fmt_amount_human(worst_balance)} around {fmt_date_human(worst_date)}.")
+    return (f"Do not make this payment by {deadline_h}. Existing commitments alone are projected to bring "
+            f"the balance to {cur} {fmt_amount_human(worst_balance)} around {fmt_date_human(worst_date)} -- "
+            f"already at or below the {cur} {fmt_amount_human(min_bal)} minimum -- so none of the available "
+            f"options keeps that minimum protected.")
 
 
 # --------------------------------------------------------------------------
