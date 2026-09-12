@@ -18,6 +18,7 @@ since OCR/vision would require a paid model call) and are hardcoded below in
 RESOLVED_IMAGE_AMOUNTS, each traceable to its source event_id and image_id.
 """
 
+import calendar
 import csv
 import os
 import re
@@ -367,7 +368,44 @@ def apply_message_overrides(events_by_id, messages_by_event):
 class RecurringSeries:
     __slots__ = ("user_id", "description", "category", "cycle_days",
                  "last_date", "last_amount", "representative", "flexibility",
-                 "minimum_allowed_amount", "direction")
+                 "minimum_allowed_amount", "direction", "cadence_type",
+                 "anchor_day")
+
+
+def _monthly_anchor_day(dates):
+    """`dates`: sorted event dates (>=2) for one recurring series. Real
+    monthly commitments in this dataset (rent, subscriptions, gym, salary,
+    ...) recur on a fixed calendar day-of-month -- not a fixed day-count
+    interval. Day-count averaging both drifts across variable month lengths
+    (28-31 days) and is easily corrupted by a single interleaved outlier
+    (e.g. a one-off quarterly bonus mixed into a blended income series,
+    which pulls the average interval well below the true ~30-day cadence).
+    When most occurrences -- and, crucially, the most recent one -- land
+    within a day of the same day-of-month, treat the series as
+    calendar-anchored and return that day; otherwise return None so the
+    caller falls back to interval-based projection (weekly/irregular
+    real-world spending like groceries, dining, transport)."""
+    last_day = dates[-1].day
+    close = sum(1 for d in dates if abs(d.day - last_day) <= 1)
+    if close >= max(2, round(len(dates) * 0.6)):
+        return last_day
+    return None
+
+
+def _advance_monthly(d, anchor_day):
+    month = d.month + 1
+    year = d.year
+    if month > 12:
+        month = 1
+        year += 1
+    day = min(anchor_day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _next_series_date(s, current):
+    if s.cadence_type == "monthly":
+        return _advance_monthly(current, s.anchor_day)
+    return current + timedelta(days=s.cycle_days)
 
 
 def detect_recurring_series(events_by_user):
@@ -417,8 +455,8 @@ def detect_recurring_series(events_by_user):
             group.sort(key=lambda e: e.event_date)
             if desc == "__income__" and group[-1].description in INCOME_TERMINATION_DESCRIPTIONS:
                 continue
-            first_d = parse_date(group[0].event_date)
-            last_d = parse_date(group[-1].event_date)
+            all_dates = [parse_date(e.event_date) for e in group]
+            first_d, last_d = all_dates[0], all_dates[-1]
             span = (last_d - first_d).days
             if span <= 0:
                 continue
@@ -430,12 +468,15 @@ def detect_recurring_series(events_by_user):
             # whole history is the conservative, representative estimate.
             cycle = int(round(span / (len(group) - 1)))
             cycle = max(cycle, 1)
+            anchor_day = _monthly_anchor_day(all_dates)
             last = group[-1]
             s = RecurringSeries()
             s.user_id = user_id
             s.description = desc
             s.category = last.category
             s.cycle_days = cycle
+            s.cadence_type = "monthly" if anchor_day else "interval"
+            s.anchor_day = anchor_day
             s.last_date = parse_date(last.event_date)
             s.last_amount = last.amount_home
             s.representative = last.event_id
@@ -512,7 +553,7 @@ def build_projected_flows(series_list, start, end, explicit_flows, overrides=Non
         amount = override[1] if isinstance(override, tuple) else s.last_amount
         is_salary = s.direction == "credit"
 
-        next_date = s.last_date + timedelta(days=s.cycle_days)
+        next_date = _next_series_date(s, s.last_date)
         guard = 0
         while next_date <= end and guard < 400:
             guard += 1
@@ -526,7 +567,7 @@ def build_projected_flows(series_list, start, end, explicit_flows, overrides=Non
                     f.event_id, f.is_projected = None, True
                     f.description, f.category = s.description, s.category
                     flows.append(f)
-            next_date = next_date + timedelta(days=s.cycle_days)
+            next_date = _next_series_date(s, next_date)
     return flows
 
 
@@ -614,6 +655,8 @@ def spending_change_candidates(profile, series_list, window_end):
             continue
         if s.category in profile.expense_categories_to_protect:
             continue
+        if _next_series_date(s, s.last_date) > window_end:
+            continue  # no occurrence left in the forecast window to change
 
         can_stop = s.flexibility in ("stoppable", "reducible_or_stoppable") and \
             s.category in profile.expense_categories_willing_to_stop
@@ -647,7 +690,7 @@ def simulate_installment_safety(balance_now, base_flows, min_balance, option, st
     pay_dates = []
     d0 = parse_date(option.first_payment_date)
     d = d0
-    for i in range(option.number_of_payments):
+    for _ in range(option.number_of_payments):
         pay_dates.append(d)
         d = d + timedelta(days=int(option.payment_frequency_days) if option.payment_frequency_days else 0)
     plan_end = max(pay_dates) if pay_dates else start
@@ -670,7 +713,6 @@ def build_payment_plan_str(pairs):
 
 
 def decide(request, profile, events, series_list, options, window_end):
-    request_id = request["request_id"]
     request_date = parse_date(request["request_date"])
     desired_completion = parse_date(request["desired_completion_date"])
     requested_amount = float(request["requested_amount"])
@@ -753,7 +795,7 @@ def decide(request, profile, events, series_list, options, window_end):
         candidates = try_spending_changes(
             profile, series_list, request_date, desired_completion, window_end,
             balance_now, min_balance, requested_amount, explicit_flows, accepted,
-            allows_partial, options, candidates)
+            options, candidates)
 
     chosen = rank_candidates(candidates)
 
@@ -763,7 +805,7 @@ def decide(request, profile, events, series_list, options, window_end):
 
     if chosen is None:
         explanation = explain_not_recommended(
-            profile, requested_amount, amt_safe_final, request_date, desired_completion,
+            profile, requested_amount, amt_safe_final, desired_completion,
             worst_balance, worst_date, earliest_full)
         return {
             "amount_safe_to_pay": amt_safe_final,
@@ -791,7 +833,7 @@ def decide(request, profile, events, series_list, options, window_end):
 
 def try_spending_changes(profile, series_list, request_date, desired_completion,
                           window_end, balance_now, min_balance, requested_amount,
-                          explicit_flows, accepted, allows_partial, options, existing_candidates):
+                          explicit_flows, accepted, options, existing_candidates):
     """Greedily apply up to 3 permitted stop/reduce changes (largest amount
     freed first) to recurring flexible expenses, stopping as soon as a safe
     plan that completes the request by its deadline is found."""
@@ -839,18 +881,15 @@ def try_spending_changes(profile, series_list, request_date, desired_completion,
             })
             return new_candidates
 
-        if (allows_partial and "partial_payment" in accepted and 0 < amt_safe < requested_amount - 1e-9
-                and earliest is not None and earliest <= desired_completion):
-            remainder = requested_amount - amt_safe
-            new_candidates.append({
-                "method": "partial_payment",
-                "plan": [(request_date, amt_safe), (earliest, remainder)],
-                "completes_by_deadline": True, "uses_changes": True,
-                "total_paid": requested_amount, "first_date": request_date,
-                "n_payments": 2, "tiebreak": "", "status": "affordable_with_plan",
-                "changes": change_tags,
-            })
-            return new_candidates
+        # No partial_payment-with-changes candidate here: both
+        # amount_safe_to_pay and earliest_date_for_full_payment are defined
+        # (problem_statement.md, "90-Day Safety Check") as the pre-change
+        # forecast values, and the partial_payment plan is required to be
+        # built from exactly those two column values. A changes-adjusted
+        # amt_safe/earliest pair would make the reported plan silently
+        # disagree with the amount_safe_to_pay / earliest_date_for_full_payment
+        # columns, so partial_payment is only ever offered without changes
+        # (see the base candidate above).
 
         if "installments" in accepted and profile.max_installment_months:
             for opt in options:
@@ -987,7 +1026,7 @@ def explain_choice(profile, request, chosen, requested_amount, amt_safe0, earlie
     return "No safe recommendation could be generated from the available data."
 
 
-def explain_not_recommended(profile, requested_amount, amt_safe_final, request_date,
+def explain_not_recommended(profile, requested_amount, amt_safe_final,
                              desired_completion, worst_balance, worst_date, earliest_full):
     cur = profile.home_currency
     min_bal = profile.minimum_balance_to_keep
