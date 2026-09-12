@@ -56,11 +56,31 @@ The natural alternative design for this challenge is an LLM-in-the-loop agent: h
 
 **Honest accuracy ceiling:** self-scored against the 25 known-correct rows in `dataset/sample_requests.csv` (not the hidden eval set — run `python3 code/evaluation/main.py` to reproduce), Ledger currently matches `affordability_status` 14/25, `recommended_payment_method` 15/25, `spending_changes_needed` 21/25, `earliest_date_for_full_payment` 10/25, and `amount_safe_to_pay` exactly on 2/25 (most others land close but not bit-exact). This is the inherent cost of reverse-engineering an undisclosed ground-truth forecasting model from 25 examples rather than a structural defect, and at least one visible mismatch (`request_16`) traces to a genuinely ambiguous input: a linked receipt image whose only extractable number ("Balance Due" 100,000) describes an unrelated prior-year, different-property, much-larger-scale rent arrangement than the user's real monthly rent — the ground truth answer implies that number should be judged irrelevant and excluded, which this rule-based engine, by design, cannot safely infer without either overfitting to this one example or risking under-trusting genuine blank-amount evidence elsewhere. No further tuning was done against the sample answers beyond what is justified directly by `problem_statement.md`, to avoid overfitting a rules engine to 25 labeled rows out of a 250-row hidden-shaped evaluation.
 
+## Setup
+
+**Requirements:** Python 3.8+ (developed/tested on 3.12), standard library only — `csv`, `os`, `re`, `calendar`, `collections`, `datetime`. No `pip install`, no `requirements.txt`, no environment variables, no API keys, and no network access are needed at any point.
+
+1. Get the code — either unzip the submitted `code.zip` into a directory, or clone the repo:
+   ```bash
+   git clone https://github.com/interviewstreet/hackerrank-orchestrate-september26.git
+   cd hackerrank-orchestrate-september26
+   ```
+2. Confirm the layout matches [Repository Layout](#repository-layout) above: `code/main.py` and `dataset/` (with `dataset/media/images/`) must sit under the same root, since `code/main.py` resolves every path relative to its own location (`CODE_DIR`/`ROOT` in the file header) — it does not depend on your current working directory.
+3. That's it — nothing to install.
+
 ## Run
 
 ```bash
 python3 code/main.py               # generates output.csv from dataset/
 python3 code/evaluation/main.py    # self-score against the 25 known sample rows
+```
+
+`python3 code/main.py` reads every file under `dataset/` and writes `output.csv` in the repository root (next to this README), overwriting any prior run. It prints `Wrote 250 rows to <path>` on success. Runs in well under a second — it's pure CSV parsing and arithmetic, no model calls.
+
+**Verify the run:**
+```bash
+head -1 output.csv   # request_id,amount_safe_to_pay,affordability_status,recommended_payment_method,payment_plan,earliest_date_for_full_payment,spending_changes_needed,decision_explanation
+wc -l output.csv      # 251 (1 header + 250 requests)
 ```
 
 No environment variables or API keys are required — Ledger makes no network calls.
