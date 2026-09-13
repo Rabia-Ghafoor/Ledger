@@ -34,7 +34,7 @@ image linked via `images.csv` (`related_event_id`), e.g. `image_07` →
 and the challenge rules require reading secrets only from environment
 variables, so rather than wiring up a paid vision API call for 16 fixed,
 one-time lookups, those 16 images were read once during development (by
-Claude, via Claude Code's multimodal file reading, while building this
+Claude, via Claude Code's multimodal file reading, not to imply there were not hand checked by me, while building this
 solution) and the transcribed amounts were hardcoded into
 `RESOLVED_IMAGE_AMOUNTS` in `code/main.py`, each with a comment citing the
 source image and the receipt line item it came from.
